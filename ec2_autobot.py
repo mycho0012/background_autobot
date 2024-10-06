@@ -13,7 +13,7 @@ def run_bot(interval_minutes):
     count = 300
 
     try:
-        bot = YingYangTradingBot(ticker, interval, count, ema=True, window=20, span=10)
+        bot = YingYangTradingBot(ticker, interval, count, ema=True, window=20, span=10, stop_loss_percentage=5, take_profit_percentage=10)
         bot.run()
     except Exception as e:
         logging.error(f"Error running bot: {str(e)}")
@@ -68,9 +68,9 @@ def main():
 
     # Send initial Telegram message
     try:
-        bot = YingYangTradingBot('KRW-BTC', f'minute{interval_minutes}', 300)
+        bot = YingYangTradingBot('KRW-BTC', f'minute{interval_minutes}', 300, stop_loss_percentage=5, take_profit_percentage=10)
         start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        bot.send_telegram_message(f"YingYang Trading Bot started at {start_time} with {interval_minutes}-minute intervals")
+        bot.send_telegram_message(f"YingYang Trading Bot started at {start_time} with {interval_minutes}-minute intervals, 5% stop loss, and 10% take profit")
     except Exception as e:
         error_message = f"Error initializing bot: {str(e)}"
         logging.error(error_message)
