@@ -11,7 +11,7 @@ from datetime import datetime
 load_dotenv()
 
 class YingYangTradingBot:
-    def __init__(self, symbol, interval, count, ema=True, window=20, span=10):
+    def __init__(self, symbol, interval, count, ema=True, window=20, span=10, stop_loss_percentage=5, take_profit_percentage=10):
         self.symbol = symbol
         self.interval = interval
         self.count = count
@@ -23,6 +23,10 @@ class YingYangTradingBot:
         self.pan_bands = None
         self.signals = None
         self.last_signal = None
+        self.stop_loss_percentage = stop_loss_percentage
+        self.take_profit_percentage = take_profit_percentage
+        self.stop_loss_price = None
+        self.take_profit_price = None
         
         # Set up logging
         logging.basicConfig(filename='trading_bot.log', level=logging.INFO, 
@@ -130,15 +134,25 @@ class YingYangTradingBot:
         for i in range(1, len(df)):
             current_status = status.iloc[i]
             previous_status = prev_status.iloc[i]
+            current_price = df['close'].iloc[i]
 
             signal_diff = current_status - previous_status
 
             if (signal_diff == 2 or signal_diff == 1) and df['YYL'].iloc[i] < -75:
                 signals['Signal'].iloc[i] = 1
-                signals['Entry_Price'].iloc[i] = df['close'].iloc[i]
+                signals['Entry_Price'].iloc[i] = current_price
             elif (signal_diff == -2 or signal_diff == -1) and df['YYL'].iloc[i] > 75:
                 signals['Signal'].iloc[i] = -1
-                signals['Exit_Price'].iloc[i] = df['close'].iloc[i]
+                signals['Exit_Price'].iloc[i] = current_price
+            elif self.position == "long":
+                if self.stop_loss_price and current_price <= self.stop_loss_price:
+                    signals['Signal'].iloc[i] = -1
+                    signals['Exit_Price'].iloc[i] = current_price
+                    logging.info(f"Stop loss triggered at {current_price}")
+                elif self.take_profit_price and current_price >= self.take_profit_price:
+                    signals['Signal'].iloc[i] = -1
+                    signals['Exit_Price'].iloc[i] = current_price
+                    logging.info(f"Take profit triggered at {current_price}")
 
         self.signals = signals
         return self.signals
@@ -180,7 +194,9 @@ class YingYangTradingBot:
                 order = self.upbit.buy_market_order(self.symbol, amount)
                 if order and 'error' not in order:
                     self.position = "long"
-                    return f"Bought {self.symbol} for {amount} KRW (30% of balance)"
+                    self.stop_loss_price = price * (1 - self.stop_loss_percentage / 100)
+                    self.take_profit_price = price * (1 + self.take_profit_percentage / 100)
+                    return f"Bought {self.symbol} for {amount} KRW (30% of balance). Stop Loss: {self.stop_loss_price:.2f}, Take Profit: {self.take_profit_price:.2f}"
                 else:
                     raise ValueError(f"Buy order failed: {order.get('error', 'Unknown error')}")
             elif signal == 'Sell' and self.position == "long":
@@ -190,6 +206,8 @@ class YingYangTradingBot:
                 order = self.upbit.sell_market_order(self.symbol, btc_balance)
                 if order and 'error' not in order:
                     self.position = "neutral"
+                    self.stop_loss_price = None
+                    self.take_profit_price = None
                     return f"Sold {btc_balance} {self.symbol}"
                 else:
                     raise ValueError(f"Sell order failed: {order.get('error', 'Unknown error')}")
@@ -219,11 +237,13 @@ class YingYangTradingBot:
                 "YYL": {"number": float(self.ying_yang_vol['YYL'].iloc[-1])},
                 "YYL_slow": {"number": float(self.ying_yang_vol['YYL_slow'].iloc[-1])},
                 "Current_position": {"rich_text": [{"text": {"content": self.position}}]},
-                "Interval": {"rich_text": [{"text": {"content": self.interval}}]}
+                "Interval": {"rich_text": [{"text": {"content": self.interval}}]},
+                "Stop_loss": {"number": self.stop_loss_price if self.stop_loss_price else None},
+                "Take_profit": {"number": self.take_profit_price if self.take_profit_price else None}
             }
         }
         notion.pages.create(**new_page)
-        logging.info(f"Notion updated: {signal_data['Ticker']} - {signal_data['last_signal']} at {signal_data['entry_price']}, Position: {self.position}, Interval: {self.interval}")
+        logging.info(f"Notion updated: {signal_data['Ticker']} - {signal_data['last_signal']} at {signal_data['entry_price']}, Position: {self.position}, Interval: {self.interval}, Stop Loss: {self.stop_loss_price}, Take Profit: {self.take_profit_price}")
 
     def send_telegram_message(self, message):
         TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -266,6 +286,10 @@ class YingYangTradingBot:
             message += f"YYL: {self.ying_yang_vol['YYL'].iloc[-1]:.2f}\n"
             message += f"YYL_slow: {self.ying_yang_vol['YYL_slow'].iloc[-1]:.2f}\n"
             message += f"Current Position: {self.position}\n"
+            if self.stop_loss_price:
+                message += f"Stop Loss: {self.stop_loss_price:.2f}\n"
+            if self.take_profit_price:
+                message += f"Take Profit: {self.take_profit_price:.2f}\n"
             message += f"Trade Result: {trade_result}"
             
             self.send_telegram_message(message)
