@@ -5,11 +5,11 @@ from class_yingyangvol import YingYangTradingBot
 import logging
 from datetime import datetime, timedelta
 
-def run_bot(interval_minutes):
+def run_bot():
     load_dotenv()
 
     ticker = 'KRW-BTC'
-    interval = f'minute{interval_minutes}'
+    interval = 'minute30'
     count = 300
 
     try:
@@ -19,26 +19,13 @@ def run_bot(interval_minutes):
         logging.error(f"Error running bot: {str(e)}")
         print(f"Error running bot: {str(e)}")
 
-def get_next_run_time(interval_minutes):
+def get_next_run_time():
     now = datetime.now()
-    minutes = now.minute
     next_run = now.replace(second=0, microsecond=0)
     
-    if interval_minutes == 15:
-        if minutes < 15:
-            next_run = next_run.replace(minute=15)
-        elif minutes < 30:
-            next_run = next_run.replace(minute=30)
-        elif minutes < 45:
-            next_run = next_run.replace(minute=45)
-        else:
-            next_run = (next_run + timedelta(hours=1)).replace(minute=0)
-    elif interval_minutes == 30:
-        if minutes < 30:
-            next_run = next_run.replace(minute=30)
-        else:
-            next_run = (next_run + timedelta(hours=1)).replace(minute=0)
-    else:  # 60 minutes
+    if now.minute < 30:
+        next_run = next_run.replace(minute=30)
+    else:
         next_run = (next_run + timedelta(hours=1)).replace(minute=0)
     
     return next_run
@@ -51,26 +38,15 @@ def main():
     print("YingYang Trading Bot started")
     logging.info("YingYang Trading Bot started")
 
-    # Ask user for the trading interval
-    while True:
-        try:
-            interval_minutes = int(input("Enter the trading interval in minutes (15, 30, or 60): "))
-            if interval_minutes in [15, 30, 60]:
-                break
-            else:
-                print("Invalid input. Please enter 15, 30, or 60.")
-        except ValueError:
-            print("Invalid input. Please enter a number.")
-
     # Create a file to indicate the bot is running
     with open("bot_running.txt", "w") as f:
         f.write("Bot is running. Delete this file to stop the bot.")
 
     # Send initial Telegram message
     try:
-        bot = YingYangTradingBot('KRW-BTC', f'minute{interval_minutes}', 300, stop_loss_percentage=5, take_profit_percentage=10)
+        bot = YingYangTradingBot('KRW-BTC', 'minute30', 300, stop_loss_percentage=5, take_profit_percentage=10)
         start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        bot.send_telegram_message(f"YingYang Trading Bot started at {start_time} with {interval_minutes}-minute intervals, 5% stop loss, and 10% take profit")
+        bot.send_telegram_message(f"YingYang Trading Bot started at {start_time} with 30-minute intervals, 5% stop loss, and 10% take profit")
     except Exception as e:
         error_message = f"Error initializing bot: {str(e)}"
         logging.error(error_message)
@@ -78,7 +54,7 @@ def main():
         return
 
     while os.path.exists("bot_running.txt"):
-        next_run = get_next_run_time(interval_minutes)
+        next_run = get_next_run_time()
         now = datetime.now()
         
         if now < next_run:
@@ -86,10 +62,10 @@ def main():
             logging.info(f"Waiting until {next_run.strftime('%Y-%m-%d %H:%M:%S')} for next run")
             time.sleep(sleep_time)
         
-        run_bot(interval_minutes)
+        run_bot()
         
         # Log that the bot completed a cycle
-        logging.info(f"Bot cycle completed. Next run at {get_next_run_time(interval_minutes).strftime('%Y-%m-%d %H:%M:%S')}")
+        logging.info(f"Bot cycle completed. Next run at {get_next_run_time().strftime('%Y-%m-%d %H:%M:%S')}")
 
     print("YingYang Trading Bot stopped")
     logging.info("YingYang Trading Bot stopped")
