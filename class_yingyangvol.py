@@ -1,14 +1,13 @@
+import time
+import os
+import logging
+import requests
+import pyupbit
 import numpy as np
 import pandas as pd
-import pyupbit
-import os
-import requests
 from notion_client import Client
 from dotenv import load_dotenv
-import logging
 from datetime import datetime
-
-load_dotenv()
 
 class YingYangTradingBot:
     def __init__(self, symbol, interval, count, ema=True, window=20, span=10, stop_loss_percentage=5, take_profit_percentage=10):
@@ -27,12 +26,16 @@ class YingYangTradingBot:
         self.take_profit_percentage = take_profit_percentage
         self.stop_loss_price = None
         self.take_profit_price = None
-        
+
         # Set up logging
-        logging.basicConfig(filename='trading_bot.log', level=logging.INFO, 
-                            format='%(asctime)s - %(levelname)s - %(message)s')
+        logging.basicConfig(
+            filename='trading_bot.log',
+            level=logging.INFO, 
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
         
         # Initialize Upbit client
+        load_dotenv()
         access_key = os.getenv("ACCESS_KEY")
         secret_key = os.getenv("SECRET_KEY")
         if not access_key or not secret_key:
@@ -47,10 +50,11 @@ class YingYangTradingBot:
             raise ValueError("Failed to authenticate with Upbit API. Please check your ACCESS_KEY and SECRET_KEY")
         
         self.position = self.get_current_position()
-    
+
     def get_current_position(self):
         try:
-            btc_balance = self.upbit.get_balance(self.symbol.split('-')[1])
+            asset = self.symbol.split('-')[1]
+            btc_balance = self.upbit.get_balance(asset)
             if btc_balance is None:
                 logging.warning(f"Unable to get balance for {self.symbol}. Assuming neutral position.")
                 return "neutral"
@@ -166,7 +170,7 @@ class YingYangTradingBot:
         last_signal_value = df['Signal'].iloc[-1]
         last_signal_str = 'Buy' if last_signal_value == 1 else 'Sell' if last_signal_value == -1 else 'No Signal'
         last_entry_price = df['close'].iloc[-1]
-        
+
         last_signal_df = pd.DataFrame({
             'Ticker': [self.symbol],
             'last_signal': [last_signal_str],
@@ -177,40 +181,151 @@ class YingYangTradingBot:
         self.last_signal = last_signal_df
         return self.last_signal
 
+    def get_current_price(self):
+        try:
+            orderbook = pyupbit.get_orderbook(tickers=self.symbol)
+            if orderbook and "orderbook_units" in orderbook[0]:
+                ask_price = orderbook[0]["orderbook_units"][0]["ask_price"]
+                bid_price = orderbook[0]["orderbook_units"][0]["bid_price"]
+                current_price = (ask_price + bid_price) / 2  # 중간 가격 사용
+                return current_price
+            else:
+                raise ValueError("Orderbook data is not available.")
+        except Exception as e:
+            logging.error(f"Error fetching current price: {str(e)}")
+            raise
+
     def execute_trade(self):
         if self.last_signal is None:
             raise ValueError("Last signal must be generated before executing trade.")
 
         signal_data = self.last_signal.iloc[0]
         signal = signal_data['last_signal']
-        price = signal_data['entry_price']
 
         try:
             if signal == 'Buy' and self.position == "neutral":
+                current_price = self.get_current_price()
+                time.sleep(1)  # 1초 대기
+
                 krw_balance = self.upbit.get_balance("KRW")
                 if krw_balance is None:
                     raise ValueError("Unable to get KRW balance")
                 amount = krw_balance * 0.3  # 30% of total KRW balance
-                order = self.upbit.buy_market_order(self.symbol, amount)
-                if order and 'error' not in order:
-                    self.position = "long"
-                    self.stop_loss_price = price * (1 - self.stop_loss_percentage / 100)
-                    self.take_profit_price = price * (1 + self.take_profit_percentage / 100)
-                    return f"Bought {self.symbol} for {amount} KRW (30% of balance). Stop Loss: {self.stop_loss_price:.2f}, Take Profit: {self.take_profit_price:.2f}"
+                volume = amount / current_price
+
+                # 제한가 매수 주문 시도
+                order = self.upbit.buy_limit_order(self.symbol, current_price, volume)
+                if order and 'uuid' in order:
+                    order_uuid = order['uuid']
+                    logging.info(f"Buy limit order placed. UUID: {order_uuid}, Price: {current_price}, Volume: {volume}")
+
+                    # 주문 체결 대기 (최대 5분)
+                    start_time = time.time()
+                    while time.time() - start_time < 300:  # 300초 = 5분
+                        order_result = self.upbit.get_order(order_uuid)
+                        state = order_result['state']
+                        if state == 'done':
+                            executed_price = order_result['price']
+                            self.position = "long"
+                            self.stop_loss_price = executed_price * (1 - self.stop_loss_percentage / 100)
+                            self.take_profit_price = executed_price * (1 + self.take_profit_percentage / 100)
+                            logging.info(f"Buy limit order filled at {executed_price} KRW")
+                            return f"Bought {self.symbol} for {amount:.2f} KRW at {executed_price:.2f} KRW. Stop Loss: {self.stop_loss_price:.2f}, Take Profit: {self.take_profit_price:.2f}"
+                        elif state == 'cancel':
+                            logging.warning(f"Buy limit order {order_uuid} was canceled.")
+                            break
+                        else:
+                            time.sleep(10)  # 10초 간격으로 상태 확인
+
+                    # 제한가 주문이 체결되지 않은 경우 주문 취소 시도
+                    cancel_result = self.upbit.cancel_order(order_uuid)
+                    if cancel_result and 'uuid' in cancel_result:
+                        logging.info(f"Buy limit order {order_uuid} canceled after 5 minutes.")
+                    else:
+                        logging.warning(f"Failed to cancel buy limit order {order_uuid}.")
+
+                    # 시장가 매수 주문 시도
+                    market_order = self.upbit.buy_market_order(self.symbol, amount)
+                    if market_order and 'uuid' in market_order:
+                        market_order_uuid = market_order['uuid']
+                        logging.info(f"Market buy order placed. UUID: {market_order_uuid}, Amount: {amount}")
+
+                        # 시장가 주문 체결 확인
+                        market_order_result = self.upbit.get_order(market_order_uuid)
+                        if market_order_result['state'] == 'done':
+                            executed_price = market_order_result['price']
+                            self.position = "long"
+                            self.stop_loss_price = executed_price * (1 - self.stop_loss_percentage / 100)
+                            self.take_profit_price = executed_price * (1 + self.take_profit_percentage / 100)
+                            logging.info(f"Market buy order executed at {executed_price} KRW")
+                            return f"Bought {self.symbol} for {amount:.2f} KRW at market price {executed_price:.2f} KRW. Stop Loss: {self.stop_loss_price:.2f}, Take Profit: {self.take_profit_price:.2f}"
+                        else:
+                            raise ValueError("Market buy order was not completed.")
+                    else:
+                        raise ValueError(f"Market buy order failed: {market_order.get('error', 'Unknown error')}")
                 else:
-                    raise ValueError(f"Buy order failed: {order.get('error', 'Unknown error')}")
+                    raise ValueError(f"Buy limit order failed: {order.get('error', 'Unknown error')}")
+
             elif signal == 'Sell' and self.position == "long":
+                current_price = self.get_current_price()
+                time.sleep(1)  # 1초 대기
+
                 btc_balance = self.upbit.get_balance(self.symbol.split('-')[1])
                 if btc_balance is None:
                     raise ValueError(f"Unable to get {self.symbol} balance")
-                order = self.upbit.sell_market_order(self.symbol, btc_balance)
-                if order and 'error' not in order:
-                    self.position = "neutral"
-                    self.stop_loss_price = None
-                    self.take_profit_price = None
-                    return f"Sold {btc_balance} {self.symbol}"
+
+                # 제한가 매도 주문 시도
+                order = self.upbit.sell_limit_order(self.symbol, current_price, btc_balance)
+                if order and 'uuid' in order:
+                    order_uuid = order['uuid']
+                    logging.info(f"Sell limit order placed. UUID: {order_uuid}, Price: {current_price}, Volume: {btc_balance}")
+
+                    # 주문 체결 대기 (최대 5분)
+                    start_time = time.time()
+                    while time.time() - start_time < 300:  # 300초 = 5분
+                        order_result = self.upbit.get_order(order_uuid)
+                        state = order_result['state']
+                        if state == 'done':
+                            executed_price = order_result['price']
+                            self.position = "neutral"
+                            self.stop_loss_price = None
+                            self.take_profit_price = None
+                            logging.info(f"Sell limit order filled at {executed_price} KRW")
+                            return f"Sold {btc_balance} {self.symbol} at {executed_price:.2f} KRW"
+                        elif state == 'cancel':
+                            logging.warning(f"Sell limit order {order_uuid} was canceled.")
+                            break
+                        else:
+                            time.sleep(10)  # 10초 간격으로 상태 확인
+
+                    # 제한가 주문이 체결되지 않은 경우 주문 취소 시도
+                    cancel_result = self.upbit.cancel_order(order_uuid)
+                    if cancel_result and 'uuid' in cancel_result:
+                        logging.info(f"Sell limit order {order_uuid} canceled after 5 minutes.")
+                    else:
+                        logging.warning(f"Failed to cancel sell limit order {order_uuid}.")
+
+                    # 시장가 매도 주문 시도
+                    market_order = self.upbit.sell_market_order(self.symbol, btc_balance)
+                    if market_order and 'uuid' in market_order:
+                        market_order_uuid = market_order['uuid']
+                        logging.info(f"Market sell order placed. UUID: {market_order_uuid}, Volume: {btc_balance}")
+
+                        # 시장가 주문 체결 확인
+                        market_order_result = self.upbit.get_order(market_order_uuid)
+                        if market_order_result['state'] == 'done':
+                            executed_price = market_order_result['price']
+                            self.position = "neutral"
+                            self.stop_loss_price = None
+                            self.take_profit_price = None
+                            logging.info(f"Market sell order executed at {executed_price} KRW")
+                            return f"Sold {btc_balance} {self.symbol} at market price {executed_price:.2f} KRW"
+                        else:
+                            raise ValueError("Market sell order was not completed.")
+                    else:
+                        raise ValueError(f"Market sell order failed: {market_order.get('error', 'Unknown error')}")
                 else:
-                    raise ValueError(f"Sell order failed: {order.get('error', 'Unknown error')}")
+                    raise ValueError(f"Sell limit order failed: {order.get('error', 'Unknown error')}")
             else:
                 return f"No trade executed. Current position: {self.position}, Signal: {signal}"
         except Exception as e:
@@ -218,32 +333,38 @@ class YingYangTradingBot:
             return f"Trade execution failed: {str(e)}"
 
     def notion_update(self):
-        NOTION_API = os.environ.get('NOTION_API')
-        DATABASE_ID = os.environ.get('DATABASE_ID')
-        notion = Client(auth=NOTION_API)
+        NOTION_API = os.getenv('NOTION_API')
+        DATABASE_ID = os.getenv('DATABASE_ID')
+        if not NOTION_API or not DATABASE_ID:
+            logging.error("NOTION_API and DATABASE_ID must be set as environment variables.")
+            return
 
-        if self.last_signal is None:
-            raise ValueError("Last signal must be generated before updating Notion.")
+        try:
+            notion = Client(auth=NOTION_API)
+            if self.last_signal is None:
+                raise ValueError("Last signal must be generated before updating Notion.")
 
-        signal_data = self.last_signal.iloc[0]
-        
-        new_page = {
-            "parent": {"database_id": DATABASE_ID},
-            "properties": {
-                "Ticker": {"title": [{"text": {"content": signal_data['Ticker']}}]},
-                "Signal_time": {"rich_text": [{"text": {"content": signal_data['timestamp'].isoformat()}}]},
-                "Last_signal": {"rich_text": [{"text": {"content": signal_data['last_signal']}}]},
-                "Entry_price": {"number": signal_data['entry_price']},
-                "YYL": {"number": float(self.ying_yang_vol['YYL'].iloc[-1])},
-                "YYL_slow": {"number": float(self.ying_yang_vol['YYL_slow'].iloc[-1])},
-                "Current_position": {"rich_text": [{"text": {"content": self.position}}]},
-                "Interval": {"rich_text": [{"text": {"content": self.interval}}]},
-                "Stop_loss": {"number": self.stop_loss_price if self.stop_loss_price else None},
-                "Take_profit": {"number": self.take_profit_price if self.take_profit_price else None}
+            signal_data = self.last_signal.iloc[0]
+            
+            new_page = {
+                "parent": {"database_id": DATABASE_ID},
+                "properties": {
+                    "Ticker": {"title": [{"text": {"content": signal_data['Ticker']}}]},
+                    "Signal_time": {"rich_text": [{"text": {"content": signal_data['timestamp'].isoformat()}}]},
+                    "Last_signal": {"rich_text": [{"text": {"content": signal_data['last_signal']}}]},
+                    "Entry_price": {"number": signal_data['entry_price']},
+                    "YYL": {"number": float(self.ying_yang_vol['YYL'].iloc[-1])},
+                    "YYL_slow": {"number": float(self.ying_yang_vol['YYL_slow'].iloc[-1])},
+                    "Current_position": {"rich_text": [{"text": {"content": self.position}}]},
+                    "Interval": {"rich_text": [{"text": {"content": self.interval}}]},
+                    "Stop_loss": {"number": self.stop_loss_price if self.stop_loss_price else None},
+                    "Take_profit": {"number": self.take_profit_price if self.take_profit_price else None}
+                }
             }
-        }
-        notion.pages.create(**new_page)
-        logging.info(f"Notion updated: {signal_data['Ticker']} - {signal_data['last_signal']} at {signal_data['entry_price']}, Position: {self.position}, Interval: {self.interval}, Stop Loss: {self.stop_loss_price}, Take Profit: {self.take_profit_price}")
+            notion.pages.create(**new_page)
+            logging.info(f"Notion updated: {signal_data['Ticker']} - {signal_data['last_signal']} at {signal_data['entry_price']}, Position: {self.position}, Interval: {self.interval}, Stop Loss: {self.stop_loss_price}, Take Profit: {self.take_profit_price}")
+        except Exception as e:
+            logging.error(f"Error updating Notion: {str(e)}")
 
     def send_telegram_message(self, message):
         TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -298,3 +419,4 @@ class YingYangTradingBot:
             error_message = f"Error in bot execution: {str(e)}"
             logging.error(error_message)
             self.send_telegram_message(f"ERROR: {error_message}")
+
